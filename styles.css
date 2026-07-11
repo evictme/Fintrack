@@ -121,6 +121,13 @@ textarea { min-height: 82px; resize: vertical; }
 .toast { position: fixed; top: calc(18px + env(safe-area-inset-top)); left: 50%; z-index: 100; max-width: calc(100% - 32px); padding: 11px 15px; color: var(--text); background: #14532d; border: 1px solid #22c55e; border-radius: 999px; box-shadow: var(--shadow); opacity: 0; pointer-events: none; transform: translate(-50%, -14px); transition: .2s ease; font-size: .84rem; font-weight: 800; text-align: center; }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 .toast.error { background: #7f1d1d; border-color: #ef4444; }
+.toast span, .toast small { display: block; }
+.toast small { margin-top: 2px; color: #dcfce7; font-size: .74rem; font-weight: 650; }
+.toast.has-action { padding-right: 7px; border-radius: 18px; pointer-events: auto; text-align: left; }
+.toast.has-action button { min-height: 36px; margin-left: 12px; padding: 7px 11px; color: #052e16; background: #bbf7d0; }
+.toast.has-action.show { display: grid; grid-template-columns: 1fr auto; align-items: center; }
+.toast.has-action small { grid-column: 1; }
+.toast.has-action button { grid-column: 2; grid-row: 1 / span 2; }
 .import-controls { display: grid; gap: 11px; }
 .field-help { margin-top: 5px; color: var(--muted); font-size: .74rem; line-height: 1.35; }
 .import-file { min-height: 66px; border: 1px solid var(--line); }

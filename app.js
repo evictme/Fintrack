@@ -16,6 +16,7 @@ import {
 import { analyzeBackup, commitBackupImport } from './backup.js';
 import { areBalancesInitialized, initializeBalances } from './balance.js';
 import { createBalanceAdjustment, deleteBalanceAdjustment, previewAdjustment, reverseBalanceAdjustment } from './adjustments.js';
+import { claimDeepLinkFingerprint, parseDeepLinkRequest } from './deep-link.js';
 
 const $ = selector => document.querySelector(selector);
 const money = value => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(Number(value || 0));
@@ -43,15 +44,35 @@ let pendingBackupAnalysis = null;
 let pendingBackupImportedAt = null;
 let promptBalancesAfterImport = false;
 let pendingImportMode = 'legacy';
+let deepLinkProcessing = false;
+let undoTransaction = null;
 const expandedRows = new Set();
 
-function showToast(message, isError = false) {
+function showToast(message, isError = false, options = {}) {
   const toast = $('#toast');
   clearTimeout(toastTimer);
-  toast.textContent = message;
+  undoTransaction = null;
+  toast.textContent = '';
+  const messageNode = document.createElement('span');
+  messageNode.textContent = message;
+  toast.append(messageNode);
+  if (options.subtitle) {
+    const subtitle = document.createElement('small');
+    subtitle.textContent = options.subtitle;
+    toast.append(subtitle);
+  }
+  if (options.undoId) {
+    undoTransaction = { id: options.undoId, expiresAt: Date.now() + (options.duration || 8000) };
+    const undoButton = document.createElement('button');
+    undoButton.type = 'button';
+    undoButton.dataset.undoTransaction = options.undoId;
+    undoButton.textContent = 'Undo';
+    toast.append(undoButton);
+  }
   toast.classList.toggle('error', isError);
+  toast.classList.toggle('has-action', Boolean(options.undoId));
   toast.classList.add('show');
-  toastTimer = setTimeout(() => toast.classList.remove('show'), 3500);
+  toastTimer = setTimeout(() => { toast.classList.remove('show'); undoTransaction = null; }, options.duration || 3500);
 }
 
 function showDialog(dialog) {
@@ -181,11 +202,12 @@ function render() {
   $('#baselineActionHelp').textContent = initialized ? 'Review or safely replace source baselines' : 'Set the current real-world balance of every source';
 }
 
-function refreshCategoryOptions(selected = '') {
+function refreshCategoryOptions(selected = '', allowBlank = false) {
   const type = $('#transactionType').value;
-  const known = CATEGORIES[type].includes(selected);
-  $('#transactionCategory').innerHTML = categoryOptions(type).map(category => `<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`).join('');
-  $('#transactionCategory').value = known ? selected : selected ? 'Custom...' : CATEGORIES[type][0];
+  const categoryType = CATEGORIES[type] ? type : 'expense';
+  const known = CATEGORIES[categoryType].includes(selected);
+  $('#transactionCategory').innerHTML = (allowBlank ? '<option value="">Choose category</option>' : '') + categoryOptions(categoryType).map(category => `<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`).join('');
+  $('#transactionCategory').value = known ? selected : selected ? 'Custom...' : allowBlank ? '' : CATEGORIES[categoryType][0];
   $('#customCategoryWrap').classList.toggle('hidden', $('#transactionCategory').value !== 'Custom...');
 }
 
@@ -194,30 +216,38 @@ function refreshStatusOptions(selected = '') {
   $('#transactionStatus').value = selected || ($('#transactionType').value === 'income' ? 'received' : 'paid');
 }
 
-function openTransactionForm(transaction = null) {
+function openTransactionForm(transaction = null, options = {}) {
+  const missingFields = options.missingFields || [];
   const date = transaction?.date || todayISO();
-  $('#transactionDialogTitle').textContent = transaction ? 'Edit Transaction' : 'Add Transaction';
+  const editing = Boolean(transaction?.id && data.transactions.some(item => item.id === transaction.id));
+  const type = transaction?.type || 'expense';
+  $('#transactionDialog').dataset.missingCategory = String(missingFields.includes('category'));
+  $('#transactionDialogTitle').textContent = editing ? 'Edit Transaction' : 'Add Transaction';
   $('#transactionId').value = transaction?.id || '';
   $('#transactionDate').value = date;
   $('#transactionDueDate').value = transaction?.dueDate || todayISO();
-  $('#transactionType').value = transaction?.type || 'expense';
-  $('#transactionSource').innerHTML = SOURCES.map(source => `<option value="${escapeHtml(source)}">${escapeHtml(source)}</option>`).join('');
-  $('#transactionSource').value = transaction?.source || SOURCES[0];
+  $('#transactionType').innerHTML = (missingFields.includes('type') ? '<option value="">Choose type</option>' : '') + '<option value="income">Income</option><option value="expense">Expense</option>';
+  $('#transactionType').value = missingFields.includes('type') ? '' : type;
+  $('#transactionSource').innerHTML = (missingFields.includes('source') ? '<option value="">Choose source</option>' : '') + SOURCES.map(source => `<option value="${escapeHtml(source)}">${escapeHtml(source)}</option>`).join('');
+  $('#transactionSource').value = transaction?.source || (missingFields.includes('source') ? '' : SOURCES[0]);
   $('#transactionAmount').value = transaction?.amount || '';
   refreshStatusOptions(transaction?.status || '');
-  const selectedCategory = transaction ? (CATEGORIES[transaction.type].includes(transaction.category) && !transaction.customCategory ? transaction.category : displayCategory(transaction)) : '';
-  refreshCategoryOptions(selectedCategory);
-  $('#customCategory').value = transaction && (!CATEGORIES[transaction.type].includes(transaction.category) || transaction.customCategory) ? displayCategory(transaction) : '';
+  const displayValue = transaction?.customCategory || transaction?.category || '';
+  const knownCategory = Object.values(CATEGORIES).flat().includes(displayValue);
+  refreshCategoryOptions(displayValue, missingFields.includes('category'));
+  $('#customCategory').value = displayValue && !knownCategory ? displayValue : '';
   $('#transactionNotes').value = transaction?.notes || '';
-  $('#transactionError').textContent = '';
+  $('#transactionError').textContent = options.message || '';
   formSubmitting = false;
   $('#saveTransactionBtn').disabled = false;
   showDialog($('#transactionDialog'));
-  setTimeout(() => $('#transactionAmount').focus(), 50);
+  const focusTargets = { type: '#transactionType', amount: '#transactionAmount', source: '#transactionSource', category: '#transactionCategory' };
+  setTimeout(() => $(focusTargets[missingFields[0]] || '#transactionAmount').focus(), 50);
 }
 
 function draftFromForm() {
   const custom = $('#transactionCategory').value === 'Custom...';
+  const existing = data.transactions.find(item => item.id === $('#transactionId').value);
   return {
     id: $('#transactionId').value,
     date: $('#transactionDate').value,
@@ -228,7 +258,8 @@ function draftFromForm() {
     customCategory: custom ? $('#customCategory').value.trim() : '',
     amount: Number($('#transactionAmount').value),
     status: $('#transactionStatus').value,
-    notes: $('#transactionNotes').value.trim()
+    notes: $('#transactionNotes').value.trim(),
+    inputMethod: existing?.inputMethod || 'manual'
   };
 }
 
@@ -455,43 +486,76 @@ function resetData() {
   showToast('FinTrack data reset.');
 }
 
-function handleDeepLink() {
-  const parameters = new URLSearchParams(location.search);
-  if (!parameters.has('action')) return;
-  const action = String(parameters.get('action') || '').toLowerCase();
-  const amount = Number(parameters.get('amount'));
-  const categoryValue = String(parameters.get('category') || '').trim();
-  const source = resolveSource(parameters.get('source'));
-  const signature = `fintrack.deepLink.${location.search}`;
-  const lastHandled = Number(sessionStorage.getItem(signature) || 0);
-  const errors = [];
-  if (!['income', 'expense'].includes(action)) errors.push('Unknown deep-link action.');
-  if (!Number.isFinite(amount) || amount <= 0) errors.push('Deep-link amount must be greater than zero.');
-  if (!categoryValue) errors.push('Deep-link category is required.');
-  if (!source) errors.push('Deep-link source is not recognized.');
-  if (Date.now() - lastHandled < 5000) errors.push('This deep link was already processed.');
+function voiceDraft(transaction) {
+  const type = transaction.type || 'expense';
+  const builtIn = transaction.category ? CATEGORIES[type]?.find(category => category.toLocaleLowerCase() === transaction.category.toLocaleLowerCase()) : null;
+  return {
+    ...transaction,
+    type: transaction.type,
+    category: builtIn || (transaction.category ? 'Custom' : ''),
+    customCategory: builtIn ? '' : (transaction.category || ''),
+    inputMethod: 'siri-voice'
+  };
+}
 
-  // Remove parameters after the one synchronous processing pass so a refresh
-  // cannot repeat a transaction. The short session lock also covers rapid opens.
-  history.replaceState({}, document.title, `${location.pathname}${location.hash}`);
-  if (errors.length) return showToast(errors[0], true);
-  sessionStorage.setItem(signature, String(Date.now()));
-  const custom = !CATEGORIES[action].includes(categoryValue);
-  const result = saveTransaction(data, {
-    date: todayISO(),
-    dueDate: todayISO(),
-    type: action,
-    source,
-    category: custom ? 'Custom' : categoryValue,
-    customCategory: custom ? categoryValue : '',
-    amount,
-    status: action === 'income' ? 'received' : 'paid',
-    notes: ''
-  });
-  if (result.errors.length) return showToast(result.errors[0], true);
+function voiceFallbackMessage(result) {
+  const labels = { type: 'transaction type', amount: 'amount', source: 'source', category: 'category' };
+  const captured = ['type', 'amount', 'source', 'category'].filter(field => !result.missingFields.includes(field)).map(field => labels[field]);
+  const missing = result.missingFields.map(field => labels[field]);
+  const capturedText = captured.length ? `I captured the ${captured.join(', ')}. ` : '';
+  return `${capturedText}Please complete the missing ${missing.join(' and ')}.`;
+}
+
+function saveLinkedTransaction(draft, kind, displayValue) {
+  const saved = saveTransaction(data, draft);
+  if (saved.errors.length) return { saved: false, error: saved.errors[0] };
   switchView('dashboardView');
   render();
-  showToast(`${action === 'income' ? 'Income' : 'Expense'} added: ${money(amount)} ${categoryValue}.`);
+  const label = draft.type === 'income' ? 'Income' : 'Expense';
+  showToast(`${label} saved`, false, {
+    subtitle: `${displayValue} · ${money(draft.amount)} · ${draft.source}`,
+    undoId: saved.transaction.id,
+    duration: 8000
+  });
+  return { saved: true, transaction: saved.transaction };
+}
+
+function processDeepLink() {
+  if (deepLinkProcessing) return false;
+  const request = parseDeepLinkRequest(location.href, { today: todayISO() });
+  if (!request) return false;
+  deepLinkProcessing = true;
+  try {
+    history.replaceState({}, document.title, request.cleanUrl);
+    if (!claimDeepLinkFingerprint(sessionStorage, request.fingerprint)) {
+      showToast('This deep link was already processed.', true);
+      return true;
+    }
+    if (request.kind === 'structured') {
+      if (request.errors.length) {
+        showToast(request.errors[0], true);
+        return true;
+      }
+      const displayValue = request.transaction.customCategory || request.transaction.category;
+      const outcome = saveLinkedTransaction(request.transaction, request.kind, displayValue);
+      if (!outcome.saved) showToast(outcome.error, true);
+      return true;
+    }
+
+    const parsed = request.result;
+    const draft = voiceDraft(parsed.transaction);
+    if (!parsed.valid) {
+      openTransactionForm(draft, { missingFields: parsed.missingFields, message: voiceFallbackMessage(parsed) });
+      parsed.originalText = '';
+      return true;
+    }
+    const outcome = saveLinkedTransaction(draft, request.kind, parsed.transaction.category);
+    if (!outcome.saved) openTransactionForm(draft, { message: outcome.error });
+    parsed.originalText = '';
+    return true;
+  } finally {
+    deepLinkProcessing = false;
+  }
 }
 
 function configureInstallAction() {
@@ -511,6 +575,16 @@ document.addEventListener('click', event => {
   if (deleteButton) deleteTransaction(deleteButton.dataset.deleteId);
   const paidButton = event.target.closest('[data-mark-paid]');
   if (paidButton) markPaid(paidButton.dataset.markPaid);
+  const undoButton = event.target.closest('[data-undo-transaction]');
+  if (undoButton && undoTransaction?.id === undoButton.dataset.undoTransaction && Date.now() <= undoTransaction.expiresAt) {
+    const before = data.transactions.length;
+    data.transactions = data.transactions.filter(transaction => transaction.id !== undoTransaction.id);
+    if (data.transactions.length !== before) {
+      saveData(data);
+      render();
+      showToast('Transaction undone.');
+    }
+  }
   const reverseAdjustmentButton = event.target.closest('[data-reverse-adjustment]');
   if (reverseAdjustmentButton && confirm('Reverse this balance adjustment?')) {
     createSafetyBackup(data, 'Before reversing balance adjustment');
@@ -551,10 +625,15 @@ $('#balanceBreakdownBtn').addEventListener('click', () => showDialog($('#balance
 $('#addTransactionBtn').addEventListener('click', () => openTransactionForm());
 $('#addTransactionTopBtn').addEventListener('click', () => openTransactionForm());
 $('#transactionType').addEventListener('change', () => {
-  refreshCategoryOptions();
+  const currentSelection = $('#transactionCategory').value;
+  const currentCategory = currentSelection === 'Custom...' ? $('#customCategory').value : currentSelection;
+  const allowBlank = $('#transactionDialog').dataset.missingCategory === 'true' && !currentCategory;
+  refreshCategoryOptions(currentCategory, allowBlank);
+  if (currentCategory && $('#transactionCategory').value === 'Custom...') $('#customCategory').value = currentCategory;
   refreshStatusOptions();
 });
 $('#transactionCategory').addEventListener('change', () => {
+  if ($('#transactionCategory').value) $('#transactionDialog').dataset.missingCategory = 'false';
   $('#customCategoryWrap').classList.toggle('hidden', $('#transactionCategory').value !== 'Custom...');
   if ($('#transactionCategory').value === 'Custom...') $('#customCategory').focus();
 });
@@ -668,5 +747,8 @@ if ('serviceWorker' in navigator) window.addEventListener('load', () => navigato
 
 render();
 configureInstallAction();
-handleDeepLink();
-if (!areBalancesInitialized(data) && !sessionStorage.getItem('fintrack.balanceSetupDismissed')) setTimeout(openBaseDialog, 150);
+const hadDeepLinkAtStartup = new URLSearchParams(location.search).has('action');
+processDeepLink();
+window.addEventListener('pageshow', processDeepLink);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') processDeepLink(); });
+if (!areBalancesInitialized(data) && !hadDeepLinkAtStartup && !sessionStorage.getItem('fintrack.balanceSetupDismissed')) setTimeout(openBaseDialog, 150);

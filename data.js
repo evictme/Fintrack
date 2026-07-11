@@ -61,6 +61,7 @@ function normalizeTransaction(item = {}, historicalByDefault = false) {
     amount: Math.abs(roundMoney(item.amount || 0)) || 0,
     status: STATUSES.includes(String(item.status || '').toLowerCase()) ? String(item.status).toLowerCase() : (type === 'income' ? 'pending' : 'unpaid'),
     notes: String(item.notes || ''),
+    inputMethod: String(item.inputMethod || ''),
     metadata: item.metadata && typeof item.metadata === 'object' ? clone(item.metadata) : {},
     legacyMetadata: item.legacyMetadata && typeof item.legacyMetadata === 'object' ? clone(item.legacyMetadata) : null,
     balanceImpact: item.balanceImpact === 'historical' ? 'historical' : (historicalByDefault ? 'historical' : 'normal'),
@@ -200,6 +201,7 @@ export function saveTransaction(data, draft) {
     balanceImpact: existing?.balanceImpact || 'normal',
     balanceEffectiveAt: nextPosted ? (previousPosted ? existing.balanceEffectiveAt : now) : null,
     createdAt: existing?.createdAt || now,
+    inputMethod: draft.inputMethod || existing?.inputMethod || 'manual',
     updatedAt: now
   });
   if (!nextPosted) transaction.balanceEffectiveAt = null;
