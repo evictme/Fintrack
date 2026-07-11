@@ -1,0 +1,672 @@
+import {
+  CATEGORIES,
+  SOURCES,
+  STATUSES,
+  calculateTotals,
+  clearData,
+  createSafetyBackup,
+  createDefaultData,
+  displayCategory,
+  loadData,
+  resolveSource,
+  saveData,
+  saveTransaction,
+  todayISO
+} from './data.js';
+import { analyzeBackup, commitBackupImport } from './backup.js';
+import { areBalancesInitialized, initializeBalances } from './balance.js';
+import { createBalanceAdjustment, deleteBalanceAdjustment, previewAdjustment, reverseBalanceAdjustment } from './adjustments.js';
+
+const $ = selector => document.querySelector(selector);
+const money = value => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(Number(value || 0));
+const escapeHtml = value => String(value ?? '').replace(/[&<>'"]/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[character]);
+const formatDate = value => {
+  if (!value) return '';
+  const [year, month, day] = value.split('-').map(Number);
+  return new Date(year, month - 1, day).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+};
+const toLocalDateTimeInput = value => {
+  const date = new Date(value);
+  date.setMinutes(date.getMinutes() - date.getTimezoneOffset());
+  return date.toISOString().slice(0, 16);
+};
+const fromLocalDateTimeInput = value => new Date(value).toISOString();
+const labelStatus = status => status.charAt(0).toUpperCase() + status.slice(1);
+const categoryOptions = type => [...CATEGORIES[type], 'Custom...'];
+
+let data = loadData();
+let deferredInstallPrompt = null;
+let toastTimer = null;
+let formSubmitting = false;
+let pendingBackupRaw = null;
+let pendingBackupAnalysis = null;
+let pendingBackupImportedAt = null;
+let promptBalancesAfterImport = false;
+let pendingImportMode = 'legacy';
+const expandedRows = new Set();
+
+function showToast(message, isError = false) {
+  const toast = $('#toast');
+  clearTimeout(toastTimer);
+  toast.textContent = message;
+  toast.classList.toggle('error', isError);
+  toast.classList.add('show');
+  toastTimer = setTimeout(() => toast.classList.remove('show'), 3500);
+}
+
+function showDialog(dialog) {
+  if (!dialog.open) dialog.showModal();
+}
+
+function closeDialog(id) {
+  const dialog = document.getElementById(id);
+  if (dialog?.open) dialog.close();
+}
+
+function switchView(viewId) {
+  document.querySelectorAll('.view').forEach(view => view.classList.toggle('active', view.id === viewId));
+  document.querySelectorAll('.nav-button').forEach(button => button.classList.toggle('active', button.dataset.view === viewId));
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function renderSourceCards(totals) {
+  $('#sourceCards').innerHTML = SOURCES.map(source => `
+    <button class="source-card" data-source-filter="${escapeHtml(source)}">
+      <span>${escapeHtml(source)} Balance</span>
+      <strong>${money(totals.balances[source])}</strong>
+      <small>View transactions</small>
+    </button>`).join('');
+}
+
+function transactionDetails(transaction) {
+  return `
+    <div class="detail-grid">
+      <div class="detail-item"><span>Date</span><strong>${formatDate(transaction.date)}</strong></div>
+      <div class="detail-item"><span>Due Date</span><strong>${formatDate(transaction.dueDate)}</strong></div>
+      <div class="detail-item"><span>Source</span><strong>${escapeHtml(transaction.source)}</strong></div>
+      <div class="detail-item"><span>Category</span><strong>${escapeHtml(displayCategory(transaction))}</strong></div>
+      <div class="detail-item"><span>Amount</span><strong>${money(transaction.amount)}</strong></div>
+      <div class="detail-item"><span>Type</span><strong>${transaction.type === 'income' ? 'Income' : 'Expense'}</strong></div>
+      <div class="detail-item"><span>Status</span><strong>${labelStatus(transaction.status)}</strong></div>
+      <div class="detail-item full"><span>Notes</span><strong>${escapeHtml(transaction.notes || 'None')}</strong></div>
+    </div>`;
+}
+
+function renderDueToday() {
+  const due = data.transactions
+    .filter(transaction => transaction.type === 'expense' && transaction.dueDate === todayISO() && transaction.status === 'unpaid')
+    .sort((a, b) => displayCategory(a).localeCompare(displayCategory(b)));
+  $('#dueCount').textContent = String(due.length);
+  $('#dueTodayList').innerHTML = due.length ? due.map(transaction => `
+    <article class="transaction-row due-row ${expandedRows.has(transaction.id) ? 'expanded' : ''}" data-row-id="${escapeHtml(transaction.id)}">
+      <button class="row-summary" data-expand-row="${escapeHtml(transaction.id)}" aria-expanded="${expandedRows.has(transaction.id)}">
+        <div><div class="row-title">${escapeHtml(displayCategory(transaction))}</div><div class="row-meta">Due ${formatDate(transaction.dueDate)} <span class="status unpaid">Unpaid</span></div></div>
+        <div class="row-amount">${money(transaction.amount)}</div>
+      </button>
+      <div class="due-actions"><button class="text-button" data-expand-row="${escapeHtml(transaction.id)}">${expandedRows.has(transaction.id) ? 'Hide details' : 'View details'}</button><button class="mark-paid" data-mark-paid="${escapeHtml(transaction.id)}">Mark Paid</button></div>
+      <div class="row-details">${transactionDetails(transaction)}<div class="row-actions"><button data-edit-id="${escapeHtml(transaction.id)}">Edit</button><button class="danger" data-delete-id="${escapeHtml(transaction.id)}">Delete</button></div></div>
+    </article>`).join('') : '<div class="empty">Nothing unpaid is due today.</div>';
+}
+
+function activeFilters() {
+  return {
+    type: $('#filterType').value,
+    source: $('#filterSource').value,
+    status: $('#filterStatus').value,
+    category: $('#filterCategory').value,
+    sort: $('#sortBy').value
+  };
+}
+
+function sortedTransactions() {
+  const filters = activeFilters();
+  const filtered = data.transactions.filter(transaction =>
+    (!filters.type || transaction.type === filters.type) &&
+    (!filters.source || transaction.source === filters.source) &&
+    (!filters.status || transaction.status === filters.status) &&
+    (!filters.category || displayCategory(transaction) === filters.category)
+  );
+  const [field, direction] = filters.sort.split('-');
+  const multiplier = direction === 'desc' ? -1 : 1;
+  return filtered.sort((a, b) => {
+    if (field === 'amount') return (a.amount - b.amount) * multiplier;
+    if (field === 'category') return displayCategory(a).localeCompare(displayCategory(b)) * multiplier;
+    const dateDifference = a.date.localeCompare(b.date) * multiplier;
+    return dateDifference || b.createdAt.localeCompare(a.createdAt);
+  });
+}
+
+function renderFilterOptions() {
+  const sourceValue = $('#filterSource').value;
+  const statusValue = $('#filterStatus').value;
+  const categoryValue = $('#filterCategory').value;
+  $('#filterSource').innerHTML = '<option value="">All sources</option>' + SOURCES.map(source => `<option value="${escapeHtml(source)}">${escapeHtml(source)}</option>`).join('');
+  $('#filterStatus').innerHTML = '<option value="">All statuses</option>' + STATUSES.map(status => `<option value="${status}">${labelStatus(status)}</option>`).join('');
+  const categories = [...new Set(data.transactions.map(displayCategory).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  $('#filterCategory').innerHTML = '<option value="">All categories</option>' + categories.map(category => `<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`).join('');
+  $('#filterSource').value = sourceValue;
+  $('#filterStatus').value = statusValue;
+  $('#filterCategory').value = categoryValue;
+}
+
+function renderTransactions() {
+  const transactions = sortedTransactions();
+  $('#transactionList').innerHTML = transactions.length ? transactions.map(transaction => `
+    <article class="transaction-row ${expandedRows.has(transaction.id) ? 'expanded' : ''}" data-row-id="${escapeHtml(transaction.id)}">
+      <button class="row-summary" data-expand-row="${escapeHtml(transaction.id)}" aria-expanded="${expandedRows.has(transaction.id)}">
+        <div><div class="row-title">${escapeHtml(displayCategory(transaction))}</div><div class="row-meta">${formatDate(transaction.date)} <span class="status ${transaction.status}">${labelStatus(transaction.status)}</span></div></div>
+        <div class="row-amount ${transaction.type}">${transaction.type === 'income' ? '+' : '-'}${money(transaction.amount)}</div>
+      </button>
+      <div class="row-details">${transactionDetails(transaction)}<div class="row-actions"><button data-edit-id="${escapeHtml(transaction.id)}">Edit</button><button class="danger" data-delete-id="${escapeHtml(transaction.id)}">Delete</button></div></div>
+    </article>`).join('') : '<div class="empty">No transactions match these filters.</div>';
+}
+
+function renderBalanceBreakdown(totals) {
+  $('#balanceBreakdown').innerHTML = SOURCES.map(source => `<div class="breakdown-row"><span>${escapeHtml(source)}</span><strong>${money(totals.balances[source])}</strong></div>`).join('') + `<div class="breakdown-row total"><span>Grand Total</span><strong>${money(totals.total)}</strong></div>`;
+}
+
+function render() {
+  const totals = calculateTotals(data);
+  const initialized = areBalancesInitialized(data);
+  $('#todayLine').textContent = new Date().toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+  $('#currentBalance').textContent = money(totals.total);
+  $('#incomeTotal').textContent = money(totals.income);
+  $('#expenseTotal').textContent = money(totals.expenses);
+  renderSourceCards(totals);
+  renderDueToday();
+  renderFilterOptions();
+  renderTransactions();
+  renderBalanceBreakdown(totals);
+  $('#baselineActionLabel').textContent = initialized ? 'Review Balance Baselines' : 'Set Initial Balances';
+  $('#baselineActionHelp').textContent = initialized ? 'Review or safely replace source baselines' : 'Set the current real-world balance of every source';
+}
+
+function refreshCategoryOptions(selected = '') {
+  const type = $('#transactionType').value;
+  const known = CATEGORIES[type].includes(selected);
+  $('#transactionCategory').innerHTML = categoryOptions(type).map(category => `<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`).join('');
+  $('#transactionCategory').value = known ? selected : selected ? 'Custom...' : CATEGORIES[type][0];
+  $('#customCategoryWrap').classList.toggle('hidden', $('#transactionCategory').value !== 'Custom...');
+}
+
+function refreshStatusOptions(selected = '') {
+  $('#transactionStatus').innerHTML = STATUSES.map(status => `<option value="${status}">${labelStatus(status)}</option>`).join('');
+  $('#transactionStatus').value = selected || ($('#transactionType').value === 'income' ? 'received' : 'paid');
+}
+
+function openTransactionForm(transaction = null) {
+  const date = transaction?.date || todayISO();
+  $('#transactionDialogTitle').textContent = transaction ? 'Edit Transaction' : 'Add Transaction';
+  $('#transactionId').value = transaction?.id || '';
+  $('#transactionDate').value = date;
+  $('#transactionDueDate').value = transaction?.dueDate || todayISO();
+  $('#transactionType').value = transaction?.type || 'expense';
+  $('#transactionSource').innerHTML = SOURCES.map(source => `<option value="${escapeHtml(source)}">${escapeHtml(source)}</option>`).join('');
+  $('#transactionSource').value = transaction?.source || SOURCES[0];
+  $('#transactionAmount').value = transaction?.amount || '';
+  refreshStatusOptions(transaction?.status || '');
+  const selectedCategory = transaction ? (CATEGORIES[transaction.type].includes(transaction.category) && !transaction.customCategory ? transaction.category : displayCategory(transaction)) : '';
+  refreshCategoryOptions(selectedCategory);
+  $('#customCategory').value = transaction && (!CATEGORIES[transaction.type].includes(transaction.category) || transaction.customCategory) ? displayCategory(transaction) : '';
+  $('#transactionNotes').value = transaction?.notes || '';
+  $('#transactionError').textContent = '';
+  formSubmitting = false;
+  $('#saveTransactionBtn').disabled = false;
+  showDialog($('#transactionDialog'));
+  setTimeout(() => $('#transactionAmount').focus(), 50);
+}
+
+function draftFromForm() {
+  const custom = $('#transactionCategory').value === 'Custom...';
+  return {
+    id: $('#transactionId').value,
+    date: $('#transactionDate').value,
+    dueDate: $('#transactionDueDate').value,
+    type: $('#transactionType').value,
+    source: $('#transactionSource').value,
+    category: custom ? 'Custom' : $('#transactionCategory').value,
+    customCategory: custom ? $('#customCategory').value.trim() : '',
+    amount: Number($('#transactionAmount').value),
+    status: $('#transactionStatus').value,
+    notes: $('#transactionNotes').value.trim()
+  };
+}
+
+function toggleExpanded(id) {
+  if (expandedRows.has(id)) expandedRows.delete(id);
+  else expandedRows.add(id);
+  renderDueToday();
+  renderTransactions();
+}
+
+function editTransaction(id) {
+  const transaction = data.transactions.find(item => item.id === id);
+  if (transaction) openTransactionForm(transaction);
+}
+
+function deleteTransaction(id) {
+  const transaction = data.transactions.find(item => item.id === id);
+  if (!transaction || !confirm(`Delete ${displayCategory(transaction)}?`)) return;
+  data.transactions = data.transactions.filter(item => item.id !== id);
+  expandedRows.delete(id);
+  saveData(data);
+  render();
+  showToast('Transaction deleted.');
+}
+
+function markPaid(id) {
+  const transaction = data.transactions.find(item => item.id === id);
+  if (!transaction || transaction.status === 'paid') return;
+  const result = saveTransaction(data, { ...transaction, status: 'paid' });
+  if (result.errors.length) return showToast(result.errors[0], true);
+  render();
+  showToast('Marked paid. Balance updated.');
+}
+
+function openBaseDialog() {
+  const initialized = areBalancesInitialized(data);
+  const baselineDate = initialized ? data.sourceBalances.SoFi.baselineDate : new Date().toISOString();
+  $('#baselineDialogTitle').textContent = initialized ? 'Review Balance Baselines' : 'Set Current Balances';
+  $('#baseBalanceFields').innerHTML = `<div class="base-date-field"><label for="baseDate">Baseline Date and Time</label><input id="baseDate" type="datetime-local" value="${escapeHtml(toLocalDateTimeInput(baselineDate))}" required><p class="field-help">Transactions and adjustments before this cutoff remain historical and do not change these balances.</p></div>` + SOURCES.map((source, index) => `<div><label for="baseSource${index}">${escapeHtml(source)} Current Balance</label><input class="money-input baseline-input" id="baseSource${index}" type="number" step="0.01" value="${initialized ? escapeHtml(data.sourceBalances[source].baselineAmount) : '0'}" required></div>`).join('');
+  $('#preventNegative').checked = data.settings.preventNegativeBalances;
+  $('#baselineReplaceWarning').classList.toggle('hidden', !initialized);
+  $('#confirmBaselineReplace').checked = false;
+  $('#skipBaselineBtn').textContent = initialized ? 'Cancel' : 'Skip for Now';
+  document.querySelectorAll('.baseline-input').forEach(input => input.addEventListener('input', updateBaselineTotal));
+  updateBaselineTotal();
+  closeDialog('settingsDialog');
+  showDialog($('#baseDialog'));
+}
+
+function updateBaselineTotal() {
+  const total = SOURCES.reduce((sum, source, index) => sum + (Number($(`#baseSource${index}`)?.value) || 0), 0);
+  $('#baselineCombinedTotal').textContent = money(total);
+}
+
+function openAdjustmentDialog() {
+  if (!areBalancesInitialized(data)) {
+    showToast('Set current balances before creating an adjustment.', true);
+    openBaseDialog();
+    return;
+  }
+  $('#adjustmentSource').innerHTML = SOURCES.map(source => `<option value="${escapeHtml(source)}">${escapeHtml(source)}</option>`).join('');
+  $('#adjustmentActual').value = '';
+  $('#adjustmentDate').value = todayISO();
+  $('#adjustmentReason').value = '';
+  $('#adjustmentError').textContent = '';
+  formSubmitting = false;
+  $('#saveAdjustmentBtn').disabled = false;
+  updateAdjustmentPreview();
+  closeDialog('settingsDialog');
+  showDialog($('#adjustBalanceDialog'));
+}
+
+function updateAdjustmentPreview() {
+  const source = $('#adjustmentSource').value || SOURCES[0];
+  const calculated = calculateTotals(data).balances[source];
+  $('#adjustmentCalculated').textContent = money(calculated);
+  const preview = previewAdjustment(data, source, $('#adjustmentActual').value);
+  $('#adjustmentDifference').textContent = preview ? money(preview.adjustmentAmount) : money(0);
+  $('#adjustmentDifference').classList.toggle('positive', Boolean(preview && preview.adjustmentAmount > 0));
+  $('#adjustmentDifference').classList.toggle('negative', Boolean(preview && preview.adjustmentAmount < 0));
+}
+
+function renderAdjustmentHistory() {
+  const adjustments = [...data.balanceAdjustments].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  $('#adjustmentHistoryList').innerHTML = adjustments.length ? adjustments.map(adjustment => `
+    <article class="adjustment-card ${adjustment.reversedAt ? 'reversed' : ''}">
+      <div class="adjustment-card-head"><div><strong>${escapeHtml(adjustment.source)}</strong><div class="adjustment-meta">${formatDate(adjustment.date)}${adjustment.reversedAt ? ' · Reversed' : ''}</div></div><div class="adjustment-amount ${adjustment.adjustmentAmount >= 0 ? 'positive' : 'negative'}">${adjustment.adjustmentAmount >= 0 ? '+' : ''}${money(adjustment.adjustmentAmount)}</div></div>
+      <div class="adjustment-meta">${money(adjustment.previousCalculatedBalance)} → ${money(adjustment.newActualBalance)}${adjustment.reason ? ` · ${escapeHtml(adjustment.reason)}` : ''}</div>
+      <div class="adjustment-actions"><button data-reverse-adjustment="${escapeHtml(adjustment.id)}" ${adjustment.reversedAt ? 'disabled' : ''}>${adjustment.reversedAt ? 'Reversed' : 'Reverse'}</button><button class="danger" data-delete-adjustment="${escapeHtml(adjustment.id)}">Delete</button></div>
+    </article>`).join('') : '<div class="empty">No manual balance adjustments.</div>';
+}
+
+function openAdjustmentHistory() {
+  renderAdjustmentHistory();
+  closeDialog('settingsDialog');
+  showDialog($('#adjustmentHistoryDialog'));
+}
+
+function exportData() {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = `fintrack-backup-${todayISO()}.json`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 0);
+  showToast('Backup exported.');
+}
+
+function resetImportPreview() {
+  pendingBackupRaw = null;
+  pendingBackupAnalysis = null;
+  pendingBackupImportedAt = null;
+  $('#legacyImportError').textContent = '';
+  $('#legacyImportPreview').classList.add('hidden');
+  $('#confirmLegacyImport').disabled = true;
+  $('#legacyFileName').textContent = 'Select a JSON backup to analyze';
+  $('#legacyImportFile').value = '';
+  $('#applyPostBaselineImports').checked = false;
+  $('#postBaselineWarning').classList.add('hidden');
+}
+
+function populateDefaultSource() {
+  $('#legacyDefaultSource').innerHTML = SOURCES.map(source => `<option value="${escapeHtml(source)}">${escapeHtml(source)}</option>`).join('');
+  $('#legacyDefaultSource').value = resolveSource(data.settings.legacyDefaultSource) || 'SoFi';
+}
+
+function openImportDialog(mode = 'legacy') {
+  pendingImportMode = mode;
+  resetImportPreview();
+  populateDefaultSource();
+  $('#importDialogTitle').textContent = mode === 'legacy' ? 'Import Legacy Backup' : 'Import Current Backup';
+  $('#defaultSourceControl').classList.toggle('hidden', mode !== 'legacy');
+  closeDialog('settingsDialog');
+  showDialog($('#legacyImportDialog'));
+}
+
+function renderImportPreview(analysis) {
+  const summary = analysis.summary;
+  $('#importFormat').textContent = analysis.formatLabel;
+  $('#importTotalFound').textContent = String(summary.totalFound);
+  $('#importToImport').textContent = String(summary.toImport);
+  $('#importDuplicates').textContent = String(summary.duplicates);
+  $('#importNewCategoryCount').textContent = String(summary.newCategories.length);
+  $('#importDefaultCount').textContent = String(summary.defaultSourceCount);
+  $('#importNewCategories').textContent = summary.newCategories.length ? summary.newCategories.join(', ') : 'None';
+  $('#importMappings').innerHTML = summary.mappings.map(mapping => `<li>${escapeHtml(mapping)}</li>`).join('');
+  $('#postBaselineCount').textContent = String(summary.postBaselineCount || 0);
+  $('#postBaselineWarning').classList.toggle('hidden', !summary.postBaselineCount || analysis.format !== 'legacy-v2');
+  $('#legacyImportPreview').classList.remove('hidden');
+  $('#confirmLegacyImport').disabled = false;
+}
+
+function analyzePendingBackup() {
+  if (!pendingBackupRaw) return;
+  try {
+    pendingBackupAnalysis = analyzeBackup(pendingBackupRaw, data, {
+      defaultSource: $('#legacyDefaultSource').value,
+      importedAt: pendingBackupImportedAt,
+      applyPostBaseline: $('#applyPostBaselineImports').checked
+    });
+    if (pendingImportMode === 'current' && pendingBackupAnalysis.format === 'legacy-v2') throw new Error('This is a legacy backup. Use Import Legacy Backup instead.');
+    if (pendingImportMode === 'legacy' && pendingBackupAnalysis.format !== 'legacy-v2') throw new Error('This is a current backup. Use Import Current Backup instead.');
+    $('#legacyImportError').textContent = '';
+    renderImportPreview(pendingBackupAnalysis);
+  } catch (error) {
+    pendingBackupAnalysis = null;
+    $('#legacyImportPreview').classList.add('hidden');
+    $('#confirmLegacyImport').disabled = true;
+    $('#legacyImportError').textContent = error.message || 'This backup could not be analyzed.';
+  }
+}
+
+async function prepareBackupImport(file, mode = pendingImportMode) {
+  if (!file) return;
+  if (!$('#legacyImportDialog').open) openImportDialog(mode);
+  $('#legacyFileName').textContent = file.name;
+  $('#legacyImportError').textContent = '';
+  try {
+    pendingBackupRaw = JSON.parse(await file.text());
+    pendingBackupImportedAt = new Date().toISOString();
+    analyzePendingBackup();
+  } catch (error) {
+    pendingBackupRaw = null;
+    pendingBackupAnalysis = null;
+    $('#legacyImportPreview').classList.add('hidden');
+    $('#confirmLegacyImport').disabled = true;
+    $('#legacyImportError').textContent = error instanceof SyntaxError ? 'This file is corrupted or is not valid JSON.' : (error.message || 'This backup is invalid.');
+  } finally {
+    $('#importFile').value = '';
+    $('#legacyImportFile').value = '';
+  }
+}
+
+function confirmBackupImport() {
+  if (!pendingBackupAnalysis) return;
+  try {
+    createSafetyBackup(data, 'Before backup import');
+    const nextData = commitBackupImport(data, pendingBackupAnalysis);
+    saveData(nextData);
+    data = nextData;
+    promptBalancesAfterImport = pendingBackupAnalysis.format === 'legacy-v2' && !areBalancesInitialized(data);
+    const summary = pendingBackupAnalysis.summary;
+    $('#resultImported').textContent = String(summary.toImport);
+    $('#resultSkipped').textContent = String(summary.duplicates);
+    $('#resultFailed').textContent = '0';
+    $('#resultProcessed').textContent = String(summary.totalFound);
+    closeDialog('legacyImportDialog');
+    render();
+    showDialog($('#importResultDialog'));
+  } catch (error) {
+    $('#legacyImportError').textContent = 'FinTrack could not save this import. No data was changed.';
+  }
+}
+
+function resetData() {
+  if (!confirm('Reset all FinTrack data on this device? This cannot be undone unless you exported a backup.')) return;
+  createSafetyBackup(data, 'Before resetting FinTrack');
+  clearData();
+  data = createDefaultData();
+  saveData(data);
+  expandedRows.clear();
+  closeDialog('settingsDialog');
+  render();
+  showToast('FinTrack data reset.');
+}
+
+function handleDeepLink() {
+  const parameters = new URLSearchParams(location.search);
+  if (!parameters.has('action')) return;
+  const action = String(parameters.get('action') || '').toLowerCase();
+  const amount = Number(parameters.get('amount'));
+  const categoryValue = String(parameters.get('category') || '').trim();
+  const source = resolveSource(parameters.get('source'));
+  const signature = `fintrack.deepLink.${location.search}`;
+  const lastHandled = Number(sessionStorage.getItem(signature) || 0);
+  const errors = [];
+  if (!['income', 'expense'].includes(action)) errors.push('Unknown deep-link action.');
+  if (!Number.isFinite(amount) || amount <= 0) errors.push('Deep-link amount must be greater than zero.');
+  if (!categoryValue) errors.push('Deep-link category is required.');
+  if (!source) errors.push('Deep-link source is not recognized.');
+  if (Date.now() - lastHandled < 5000) errors.push('This deep link was already processed.');
+
+  // Remove parameters after the one synchronous processing pass so a refresh
+  // cannot repeat a transaction. The short session lock also covers rapid opens.
+  history.replaceState({}, document.title, `${location.pathname}${location.hash}`);
+  if (errors.length) return showToast(errors[0], true);
+  sessionStorage.setItem(signature, String(Date.now()));
+  const custom = !CATEGORIES[action].includes(categoryValue);
+  const result = saveTransaction(data, {
+    date: todayISO(),
+    dueDate: todayISO(),
+    type: action,
+    source,
+    category: custom ? 'Custom' : categoryValue,
+    customCategory: custom ? categoryValue : '',
+    amount,
+    status: action === 'income' ? 'received' : 'paid',
+    notes: ''
+  });
+  if (result.errors.length) return showToast(result.errors[0], true);
+  switchView('dashboardView');
+  render();
+  showToast(`${action === 'income' ? 'Income' : 'Expense'} added: ${money(amount)} ${categoryValue}.`);
+}
+
+function configureInstallAction() {
+  const isAppleMobile = /iphone|ipad|ipod/i.test(navigator.userAgent);
+  const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+  if ((deferredInstallPrompt || (isAppleMobile && !standalone)) && !standalone) $('#installAppBtn').classList.remove('hidden');
+}
+
+document.addEventListener('click', event => {
+  const closeButton = event.target.closest('[data-close]');
+  if (closeButton) closeDialog(closeButton.dataset.close);
+  const expandButton = event.target.closest('[data-expand-row]');
+  if (expandButton) toggleExpanded(expandButton.dataset.expandRow);
+  const editButton = event.target.closest('[data-edit-id]');
+  if (editButton) editTransaction(editButton.dataset.editId);
+  const deleteButton = event.target.closest('[data-delete-id]');
+  if (deleteButton) deleteTransaction(deleteButton.dataset.deleteId);
+  const paidButton = event.target.closest('[data-mark-paid]');
+  if (paidButton) markPaid(paidButton.dataset.markPaid);
+  const reverseAdjustmentButton = event.target.closest('[data-reverse-adjustment]');
+  if (reverseAdjustmentButton && confirm('Reverse this balance adjustment?')) {
+    createSafetyBackup(data, 'Before reversing balance adjustment');
+    if (reverseBalanceAdjustment(data, reverseAdjustmentButton.dataset.reverseAdjustment)) {
+      saveData(data);
+      render();
+      renderAdjustmentHistory();
+      showToast('Balance adjustment reversed.');
+    }
+  }
+  const deleteAdjustmentButton = event.target.closest('[data-delete-adjustment]');
+  if (deleteAdjustmentButton && confirm('Permanently delete this balance adjustment?')) {
+    createSafetyBackup(data, 'Before deleting balance adjustment');
+    if (deleteBalanceAdjustment(data, deleteAdjustmentButton.dataset.deleteAdjustment)) {
+      saveData(data);
+      render();
+      renderAdjustmentHistory();
+      showToast('Balance adjustment deleted.');
+    }
+  }
+  const sourceButton = event.target.closest('[data-source-filter]');
+  if (sourceButton) {
+    ['filterType', 'filterStatus', 'filterCategory'].forEach(id => { document.getElementById(id).value = ''; });
+    $('#filterSource').value = sourceButton.dataset.sourceFilter;
+    $('#sortBy').value = 'date-desc';
+    switchView('transactionsView');
+    renderTransactions();
+  }
+});
+
+document.querySelectorAll('.nav-button').forEach(button => button.addEventListener('click', () => switchView(button.dataset.view)));
+document.querySelectorAll('.modal').forEach(dialog => dialog.addEventListener('click', event => {
+  if (event.target === dialog) dialog.close();
+}));
+
+$('#settingsBtn').addEventListener('click', () => showDialog($('#settingsDialog')));
+$('#balanceBreakdownBtn').addEventListener('click', () => showDialog($('#balanceDialog')));
+$('#addTransactionBtn').addEventListener('click', () => openTransactionForm());
+$('#addTransactionTopBtn').addEventListener('click', () => openTransactionForm());
+$('#transactionType').addEventListener('change', () => {
+  refreshCategoryOptions();
+  refreshStatusOptions();
+});
+$('#transactionCategory').addEventListener('change', () => {
+  $('#customCategoryWrap').classList.toggle('hidden', $('#transactionCategory').value !== 'Custom...');
+  if ($('#transactionCategory').value === 'Custom...') $('#customCategory').focus();
+});
+$('#transactionForm').addEventListener('submit', event => {
+  event.preventDefault();
+  if (formSubmitting) return;
+  formSubmitting = true;
+  $('#saveTransactionBtn').disabled = true;
+  const result = saveTransaction(data, draftFromForm());
+  if (result.errors.length) {
+    $('#transactionError').textContent = result.errors[0];
+    formSubmitting = false;
+    $('#saveTransactionBtn').disabled = false;
+    return;
+  }
+  closeDialog('transactionDialog');
+  render();
+  showToast($('#transactionId').value ? 'Transaction updated.' : 'Transaction added.');
+});
+
+['filterType', 'filterSource', 'filterStatus', 'filterCategory', 'sortBy'].forEach(id => document.getElementById(id).addEventListener('change', renderTransactions));
+$('#clearFiltersBtn').addEventListener('click', () => {
+  ['filterType', 'filterSource', 'filterStatus', 'filterCategory'].forEach(id => { document.getElementById(id).value = ''; });
+  $('#sortBy').value = 'date-desc';
+  renderTransactions();
+});
+$('#exportBtn').addEventListener('click', exportData);
+$('#importFile').addEventListener('change', event => prepareBackupImport(event.target.files[0], 'current'));
+$('#legacyImportBtn').addEventListener('click', () => openImportDialog('legacy'));
+$('#legacyImportFile').addEventListener('change', event => prepareBackupImport(event.target.files[0]));
+$('#legacyDefaultSource').addEventListener('change', analyzePendingBackup);
+$('#applyPostBaselineImports').addEventListener('change', analyzePendingBackup);
+$('#confirmLegacyImport').addEventListener('click', confirmBackupImport);
+$('#baseBalancesBtn').addEventListener('click', openBaseDialog);
+$('#adjustBalancesBtn').addEventListener('click', openAdjustmentDialog);
+$('#adjustmentHistoryBtn').addEventListener('click', openAdjustmentHistory);
+$('#adjustmentSource').addEventListener('change', updateAdjustmentPreview);
+$('#adjustmentActual').addEventListener('input', updateAdjustmentPreview);
+$('#resetBtn').addEventListener('click', resetData);
+$('#skipBaselineBtn').addEventListener('click', () => {
+  sessionStorage.setItem('fintrack.balanceSetupDismissed', '1');
+  closeDialog('baseDialog');
+});
+$('#baseForm').addEventListener('submit', event => {
+  event.preventDefault();
+  const replacing = areBalancesInitialized(data);
+  if (replacing && !$('#confirmBaselineReplace').checked) return showToast('Confirm that you want to replace the existing baselines.', true);
+  const amounts = Object.fromEntries(SOURCES.map((source, index) => [source, Number($(`#baseSource${index}`).value)]));
+  let baselineDate;
+  try { baselineDate = fromLocalDateTimeInput($('#baseDate').value); } catch (error) { return showToast('Choose a valid baseline date and time.', true); }
+  createSafetyBackup(data, replacing ? 'Before replacing balance baselines' : 'Before initializing balances');
+  const result = initializeBalances(data, amounts, baselineDate);
+  if (result.error) return showToast(result.error, true);
+  data.settings.preventNegativeBalances = $('#preventNegative').checked;
+  saveData(data);
+  closeDialog('baseDialog');
+  sessionStorage.removeItem('fintrack.balanceSetupDismissed');
+  render();
+  showToast(replacing ? 'Balance baselines replaced.' : 'Current balances initialized.');
+});
+
+$('#adjustBalanceForm').addEventListener('submit', event => {
+  event.preventDefault();
+  if (formSubmitting) return;
+  formSubmitting = true;
+  $('#saveAdjustmentBtn').disabled = true;
+  createSafetyBackup(data, 'Before balance adjustment');
+  const result = createBalanceAdjustment(data, {
+    source: $('#adjustmentSource').value,
+    newActualBalance: $('#adjustmentActual').value,
+    date: $('#adjustmentDate').value,
+    reason: $('#adjustmentReason').value
+  });
+  if (result.errors.length) {
+    $('#adjustmentError').textContent = result.errors[0];
+    formSubmitting = false;
+    $('#saveAdjustmentBtn').disabled = false;
+    return;
+  }
+  saveData(data);
+  formSubmitting = false;
+  $('#saveAdjustmentBtn').disabled = false;
+  closeDialog('adjustBalanceDialog');
+  render();
+  showToast('Balance adjustment saved.');
+});
+
+$('#importResultDialog').addEventListener('close', () => {
+  if (promptBalancesAfterImport) {
+    promptBalancesAfterImport = false;
+    setTimeout(openBaseDialog, 0);
+  }
+});
+
+window.addEventListener('beforeinstallprompt', event => {
+  event.preventDefault();
+  deferredInstallPrompt = event;
+  configureInstallAction();
+});
+$('#installAppBtn').addEventListener('click', async () => {
+  if (deferredInstallPrompt) {
+    await deferredInstallPrompt.prompt();
+    deferredInstallPrompt = null;
+    $('#installAppBtn').classList.add('hidden');
+  } else {
+    alert('On iPhone or iPad, open FinTrack in Safari, tap Share, then choose Add to Home Screen.');
+  }
+});
+
+if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(() => {}));
+
+render();
+configureInstallAction();
+handleDeepLink();
+if (!areBalancesInitialized(data) && !sessionStorage.getItem('fintrack.balanceSetupDismissed')) setTimeout(openBaseDialog, 150);
